@@ -39,6 +39,114 @@ let lastBy = null;
 let drawing = false;
 let drawValue = 1; // 1 draw, 0 erase
 
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 6;
+
+const view = { scale: 1, offsetX: 0, offsetY: 0 };
+let gestureState = null;
+let panState = null;
+let wheelZoomTimer = null;
+let isTransforming = false;
+const activePointers = new Map();
+let pointerDrawingId = null;
+
+const isPanModifier = (event) =>
+  event.shiftKey || event.ctrlKey || event.metaKey;
+
+const updateTransformingFlag = () => {
+  isTransforming = Boolean(gestureState || panState || wheelZoomTimer);
+};
+
+const resetViewTransform = () => {
+  view.scale = 1;
+  view.offsetX = 0;
+  view.offsetY = 0;
+};
+
+const clampViewOffset = (rect) => {
+  if (!spec || rect.width === 0 || rect.height === 0) return;
+  const minX = rect.width - rect.width * view.scale;
+  const minY = rect.height - rect.height * view.scale;
+  view.offsetX = clamp(view.offsetX, minX, 0);
+  view.offsetY = clamp(view.offsetY, minY, 0);
+};
+
+const specCoordFromCss = (cssValue, rectSize, specSize, axisOffset) => {
+  if (rectSize === 0 || view.scale === 0) return 0;
+  const base = (cssValue - axisOffset) / view.scale;
+  return clamp((base / rectSize) * specSize, 0, specSize);
+};
+
+const getViewSourceRect = (rect) => {
+  if (!spec || rect.width === 0 || rect.height === 0) {
+    return {
+      sx: 0,
+      sy: 0,
+      sw: spec?.frames || 0,
+      sh: spec?.bins || 0,
+    };
+  }
+
+  const left = specCoordFromCss(0, rect.width, spec.frames, view.offsetX);
+  const right = specCoordFromCss(
+    rect.width,
+    rect.width,
+    spec.frames,
+    view.offsetX
+  );
+  const top = specCoordFromCss(0, rect.height, spec.bins, view.offsetY);
+  const bottom = specCoordFromCss(
+    rect.height,
+    rect.height,
+    spec.bins,
+    view.offsetY
+  );
+
+  const leftClamped = clamp(left, 0, spec.frames);
+  const rightClamped = clamp(right, 0, spec.frames);
+  const topClamped = clamp(top, 0, spec.bins);
+  const bottomClamped = clamp(bottom, 0, spec.bins);
+
+  const sw = Math.max(1, rightClamped - leftClamped);
+  const sh = Math.max(1, bottomClamped - topClamped);
+
+  return {
+    sx: Math.max(0, Math.min(leftClamped, spec.frames - sw)),
+    sy: Math.max(0, Math.min(topClamped, spec.bins - sh)),
+    sw,
+    sh,
+  };
+};
+
+const applyZoom = (newScale, focalX, focalY) => {
+  if (!spec) return;
+  const rect = els.canvas.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+
+  const clampedScale = clamp(newScale, MIN_ZOOM, MAX_ZOOM);
+  const prevScale = view.scale;
+  if (prevScale === 0) return;
+
+  const baseX = (focalX - view.offsetX) / prevScale;
+  const baseY = (focalY - view.offsetY) / prevScale;
+
+  view.scale = clampedScale;
+  view.offsetX = focalX - baseX * view.scale;
+  view.offsetY = focalY - baseY * view.scale;
+
+  clampViewOffset(rect);
+};
+
+const cancelActiveTransforms = () => {
+  gestureState = null;
+  panState = null;
+  if (wheelZoomTimer) {
+    clearTimeout(wheelZoomTimer);
+    wheelZoomTimer = null;
+  }
+  updateTransformingFlag();
+};
+
 const setStatus = (text) => {
   els.status.textContent = text;
 };
@@ -71,22 +179,29 @@ const clearMask = () => {
 };
 
 const canvasToSpec = (clientX, clientY) => {
+  if (!spec) return [0, 0];
   const rect = els.canvas.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return [0, 0];
+
   const xCss = clientX - rect.left;
   const yCss = clientY - rect.top;
 
-  const fx = clamp(
-    Math.floor((xCss / rect.width) * spec.frames),
+  const specX = clamp(
+    Math.floor(
+      specCoordFromCss(xCss, rect.width, spec.frames, view.offsetX)
+    ),
     0,
     spec.frames - 1
   );
-  const byTop = clamp(
-    Math.floor((yCss / rect.height) * spec.bins),
+  const specYTop = clamp(
+    Math.floor(
+      specCoordFromCss(yCss, rect.height, spec.bins, view.offsetY)
+    ),
     0,
     spec.bins - 1
   );
-  const bin = spec.bins - 1 - byTop;
-  return [fx, bin];
+  const bin = spec.bins - 1 - specYTop;
+  return [specX, bin];
 };
 
 const paintCell = (frameX, binY, value01) => {
@@ -127,22 +242,175 @@ const paintLine = (x0, y0, x1, y1, value01) => {
   }
 };
 
+const endDraw = () => {
+  drawing = false;
+  lastFx = null;
+  lastBy = null;
+  pointerDrawingId = null;
+};
+
+const endPan = () => {
+  panState = null;
+  updateTransformingFlag();
+};
+
+const endGesture = () => {
+  gestureState = null;
+  updateTransformingFlag();
+};
+
+const startDrawing = (event) => {
+  drawing = true;
+  pointerDrawingId = event.pointerId;
+  drawValue = event.button === 2 ? 0 : 1;
+  const [fx, by] = canvasToSpec(event.clientX, event.clientY);
+  lastFx = fx;
+  lastBy = by;
+  paintCell(fx, by, drawValue);
+};
+
+const startPan = (event) => {
+  panState = {
+    pointerId: event.pointerId,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    offsetX: view.offsetX,
+    offsetY: view.offsetY,
+  };
+  endDraw();
+  endGesture();
+  updateTransformingFlag();
+};
+
+const updatePan = (event) => {
+  if (!panState || event.pointerId !== panState.pointerId) return;
+  const rect = els.canvas.getBoundingClientRect();
+  const deltaX = event.clientX - panState.clientX;
+  const deltaY = event.clientY - panState.clientY;
+
+  view.offsetX = panState.offsetX + deltaX;
+  view.offsetY = panState.offsetY + deltaY;
+  clampViewOffset(rect);
+};
+
+const startGesture = () => {
+  if (activePointers.size < 2) return;
+  const entries = Array.from(activePointers.entries()).slice(0, 2);
+  if (entries.length < 2) return;
+  const pointerIds = entries.map(([id]) => id);
+  const positions = entries.map(([, pos]) => pos);
+  if (positions.some((pos) => !pos)) return;
+
+  const center = {
+    x: (positions[0].clientX + positions[1].clientX) / 2,
+    y: (positions[0].clientY + positions[1].clientY) / 2,
+  };
+  const distance = Math.max(
+    1,
+    Math.hypot(
+      positions[1].clientX - positions[0].clientX,
+      positions[1].clientY - positions[0].clientY
+    )
+  );
+
+  endDraw();
+  endPan();
+
+  gestureState = {
+    pointerIds,
+    startCenter: center,
+    startDistance: distance,
+    startZoom: view.scale,
+    startOffsetX: view.offsetX,
+    startOffsetY: view.offsetY,
+  };
+  updateTransformingFlag();
+};
+
+const updateGesture = () => {
+  if (!gestureState) return;
+  const positions = gestureState.pointerIds
+    .map((id) => activePointers.get(id))
+    .filter(Boolean);
+  if (positions.length < 2) {
+    endGesture();
+    return;
+  }
+
+  const center = {
+    x: (positions[0].clientX + positions[1].clientX) / 2,
+    y: (positions[0].clientY + positions[1].clientY) / 2,
+  };
+  const dx = positions[1].clientX - positions[0].clientX;
+  const dy = positions[1].clientY - positions[0].clientY;
+  const distance = Math.max(1, Math.hypot(dx, dy));
+
+  const zoomFactor = distance / gestureState.startDistance;
+  const targetScale = clamp(
+    gestureState.startZoom * zoomFactor,
+    MIN_ZOOM,
+    MAX_ZOOM
+  );
+
+  const centerDeltaX = center.x - gestureState.startCenter.x;
+  const centerDeltaY = center.y - gestureState.startCenter.y;
+  const offsetAfterPanX = gestureState.startOffsetX + centerDeltaX;
+  const offsetAfterPanY = gestureState.startOffsetY + centerDeltaY;
+  const baseX = (center.x - offsetAfterPanX) / gestureState.startZoom;
+  const baseY = (center.y - offsetAfterPanY) / gestureState.startZoom;
+
+  view.scale = targetScale;
+  view.offsetX = center.x - baseX * view.scale;
+  view.offsetY = center.y - baseY * view.scale;
+
+  const rect = els.canvas.getBoundingClientRect();
+  clampViewOffset(rect);
+};
+
 const drawFrame = () => {
   const ctx = els.canvas.getContext("2d");
   const { w, h } = resizeCanvasToCSS(els.canvas);
 
   ctx.clearRect(0, 0, w, h);
 
+  const rect = els.canvas.getBoundingClientRect();
+  clampViewOffset(rect);
+  const sourceRect = spec ? getViewSourceRect(rect) : null;
+
   if (bitmap) {
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(bitmap, 0, 0, w, h);
+    if (sourceRect && spec) {
+      ctx.drawImage(
+        bitmap,
+        sourceRect.sx,
+        sourceRect.sy,
+        sourceRect.sw,
+        sourceRect.sh,
+        0,
+        0,
+        w,
+        h
+      );
+    } else {
+      ctx.drawImage(bitmap, 0, 0, w, h);
+    }
   }
 
-  if (maskCanvas) {
+  if (maskCanvas && sourceRect && spec) {
     ctx.save();
     ctx.imageSmoothingEnabled = false;
     ctx.globalAlpha = 1;
-    ctx.drawImage(maskCanvas, 0, 0, w, h);
+    ctx.drawImage(
+      maskCanvas,
+      sourceRect.sx,
+      sourceRect.sy,
+      sourceRect.sw,
+      sourceRect.sh,
+      0,
+      0,
+      w,
+      h
+    );
     ctx.restore();
   }
 
@@ -205,6 +473,8 @@ els.samples.addEventListener("change", async () => {
     maskCanvas = null;
     maskCtx = null;
     player.stop();
+    cancelActiveTransforms();
+    resetViewTransform();
 
     setStatus(
       `ready (${decoded.sampleRate} Hz, ${formatSec(decoded.buffer.duration)})`
@@ -229,6 +499,8 @@ els.file.addEventListener("change", async () => {
   drawMask = null;
   maskCanvas = null;
   maskCtx = null;
+  cancelActiveTransforms();
+  resetViewTransform();
 
   player.stop();
 
@@ -260,17 +532,20 @@ els.render.addEventListener("click", async () => {
 
   await nextFrame();
 
-  try {
-    spec = computeSpectrogram({
-      samples: decoded.mono,
-      sampleRate: decoded.sampleRate,
-      winSize: WIN_SIZE,
-      hopSize: HOP_SIZE,
-      maxFreqHz,
-      dbRange: DB_RANGE,
-    });
+    try {
+      spec = computeSpectrogram({
+        samples: decoded.mono,
+        sampleRate: decoded.sampleRate,
+        winSize: WIN_SIZE,
+        hopSize: HOP_SIZE,
+        maxFreqHz,
+        dbRange: DB_RANGE,
+      });
 
-    bitmap = makeSpectrogramBitmap(spec);
+      resetViewTransform();
+      cancelActiveTransforms();
+
+      bitmap = makeSpectrogramBitmap(spec);
     initMask(spec);
 
     setStatus("spectrogram ready (draw RED to hear; erase to remove)");
@@ -335,38 +610,95 @@ els.stop.addEventListener("click", () => {
 els.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
 els.canvas.addEventListener("pointerdown", (event) => {
-  if (!spec || !drawMask) return;
-  drawing = true;
-  drawValue = event.button === 2 ? 0 : 1;
+  event.preventDefault();
+  activePointers.set(event.pointerId, {
+    clientX: event.clientX,
+    clientY: event.clientY,
+  });
   els.canvas.setPointerCapture(event.pointerId);
 
-  const [fx, by] = canvasToSpec(event.clientX, event.clientY);
-  lastFx = fx;
-  lastBy = by;
-  paintCell(fx, by, drawValue);
+  if (!spec || !drawMask) return;
+
+  if (!gestureState && activePointers.size >= 2) {
+    startGesture();
+    return;
+  }
+
+  if (isPanModifier(event)) {
+    startPan(event);
+    return;
+  }
+
+  if (!isTransforming) {
+    startDrawing(event);
+  }
 });
 
 els.canvas.addEventListener("pointermove", (event) => {
-  if (!drawing || !spec || !drawMask) return;
-  const [fx, by] = canvasToSpec(event.clientX, event.clientY);
-
-  if (lastFx !== null) {
-    paintLine(lastFx, lastBy, fx, by, drawValue);
+  if (activePointers.has(event.pointerId)) {
+    activePointers.set(event.pointerId, {
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
   }
 
-  lastFx = fx;
-  lastBy = by;
+  if (!spec || !drawMask) return;
+
+  if (gestureState) {
+    updateGesture();
+    return;
+  }
+
+  if (panState && event.pointerId === panState.pointerId) {
+    updatePan(event);
+    return;
+  }
+
+  if (
+    drawing &&
+    pointerDrawingId === event.pointerId &&
+    !isTransforming
+  ) {
+    const [fx, by] = canvasToSpec(event.clientX, event.clientY);
+    if (lastFx !== null) {
+      paintLine(lastFx, lastBy, fx, by, drawValue);
+    }
+    lastFx = fx;
+    lastBy = by;
+  }
 });
 
-const endDraw = () => {
-  drawing = false;
-  lastFx = null;
-  lastBy = null;
+const handlePointerEnd = (event) => {
+  activePointers.delete(event.pointerId);
+  if (gestureState && activePointers.size < 2) {
+    endGesture();
+  }
+  if (panState && panState.pointerId === event.pointerId) {
+    endPan();
+  }
+  if (pointerDrawingId === event.pointerId) {
+    endDraw();
+  }
+  els.canvas.releasePointerCapture(event.pointerId);
 };
 
-els.canvas.addEventListener("pointerup", endDraw);
-els.canvas.addEventListener("pointercancel", endDraw);
+els.canvas.addEventListener("pointerup", handlePointerEnd);
+els.canvas.addEventListener("pointercancel", handlePointerEnd);
 els.canvas.addEventListener("pointerleave", endDraw);
+
+els.canvas.addEventListener("wheel", (event) => {
+  if (!spec) return;
+  event.preventDefault();
+  const zoomAmount = Math.pow(1.0015, -event.deltaY);
+  applyZoom(view.scale * zoomAmount, event.clientX, event.clientY);
+
+  if (wheelZoomTimer) clearTimeout(wheelZoomTimer);
+  wheelZoomTimer = setTimeout(() => {
+    wheelZoomTimer = null;
+    updateTransformingFlag();
+  }, 220);
+  updateTransformingFlag();
+});
 
 setStatus("load an audio file");
 setButtons(false);
