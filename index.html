@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <title>Canvas Spectrogram (Draw + Hear)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
     <style>
       html,
       body {
@@ -11,6 +12,9 @@
         background: #06080c;
         color: #e6edf3;
         font-family: system-ui, sans-serif;
+        user-select: none;
+        overscroll-behavior: none;
+        -webkit-user-select: none;
       }
 
       .wrap {
@@ -56,11 +60,29 @@
   <body>
     <div class="wrap">
       <div class="bar">
+        <select id="samples">
+          <option value="">— samples —</option>
+          <option value="curiosity-killed-the-cat.mp3">
+            curiosity-killed-the-cat
+          </option>
+          <option value="supercalifragilistic.mp3">supercalifragilistic</option>
+          <option value="world.mp3">world</option>
+        </select>
+
         <input
           id="file"
           type="file"
           accept="audio/mpeg,audio/mp3,audio/wav,audio/*"
         />
+
+        <select id="maxfreq">
+          <option value="3000">3 kHz</option>
+          <option value="5000">5 kHz</option>
+          <option value="7000" selected>7 kHz</option>
+          <option value="10000">10 kHz</option>
+          <option value="16000">16 kHz</option>
+        </select>
+
         <button id="render" disabled>Render Spectrogram</button>
 
         <button id="play" disabled>Play (what you drew)</button>
@@ -383,6 +405,8 @@
 
       const els = {
         file: document.getElementById("file"),
+        samples: document.getElementById("samples"),
+        maxfreq: document.getElementById("maxfreq"),
         render: document.getElementById("render"),
         play: document.getElementById("play"),
         pause: document.getElementById("pause"),
@@ -392,6 +416,51 @@
         time: document.getElementById("time"),
         canvas: document.getElementById("canvas"),
       };
+
+      let MAX_FREQ_HZ = Number(els.maxfreq.value);
+
+      let lastFx = null;
+      let lastBy = null;
+
+      els.maxfreq.addEventListener("change", () => {
+        MAX_FREQ_HZ = Number(els.maxfreq.value);
+        setStatus("max frequency changed – re-render required");
+        setButtons(false);
+        els.render.disabled = false;
+      });
+
+      els.samples.addEventListener("change", async () => {
+        const name = els.samples.value;
+        if (!name) return;
+
+        setStatus("loading sample…");
+        setButtons(false);
+
+        try {
+          const res = await fetch(name);
+          const blob = await res.blob();
+          const file = new File([blob], name, { type: blob.type });
+
+          decoded = await decodeAudioFile(file);
+
+          spec = null;
+          bitmap = null;
+          drawMask = null;
+          maskCanvas = null;
+          maskCtx = null;
+          player.stop();
+
+          setStatus(
+            `ready (${decoded.sampleRate} Hz, ${formatSec(
+              decoded.buffer.duration
+            )})`
+          );
+          els.render.disabled = false;
+        } catch (e) {
+          console.error(e);
+          setStatus("sample load failed");
+        }
+      });
 
       const player = new AudioPlayer();
 
@@ -408,7 +477,6 @@
 
       const WIN_SIZE = 4096;
       const HOP_SIZE = 512;
-      const MAX_FREQ_HZ = 7000;
       const DB_RANGE = 80;
 
       const setStatus = (t) => (els.status.textContent = t);
@@ -477,6 +545,31 @@
           maskCtx.fillRect(frameX, cy, 1, 1);
         } else {
           maskCtx.clearRect(frameX, cy, 1, 1);
+        }
+      };
+
+      const paintLine = (x0, y0, x1, y1, value01) => {
+        const dx = Math.abs(x1 - x0);
+        const dy = Math.abs(y1 - y0);
+        const sx = x0 < x1 ? 1 : -1;
+        const sy = y0 < y1 ? 1 : -1;
+        let err = dx - dy;
+
+        let x = x0;
+        let y = y0;
+
+        while (true) {
+          paintCell(x, y, value01);
+          if (x === x1 && y === y1) break;
+          const e2 = 2 * err;
+          if (e2 > -dy) {
+            err -= dy;
+            x += sx;
+          }
+          if (e2 < dx) {
+            err += dx;
+            y += sy;
+          }
         }
       };
 
@@ -734,17 +827,26 @@
         els.canvas.setPointerCapture(e.pointerId);
 
         const [fx, by] = canvasToSpec(e.clientX, e.clientY);
+        lastFx = fx;
+        lastBy = by;
         paintCell(fx, by, drawValue);
       });
 
       els.canvas.addEventListener("pointermove", (e) => {
         if (!drawing || !spec || !drawMask) return;
         const [fx, by] = canvasToSpec(e.clientX, e.clientY);
-        paintCell(fx, by, drawValue);
-      });
 
+        if (lastFx !== null) {
+          paintLine(lastFx, lastBy, fx, by, drawValue);
+        }
+
+        lastFx = fx;
+        lastBy = by;
+      });
       const endDraw = () => {
         drawing = false;
+        lastFx = null;
+        lastBy = null;
       };
 
       els.canvas.addEventListener("pointerup", endDraw);
