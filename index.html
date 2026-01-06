@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Canvas Spectrogram</title>
+    <title>Canvas Spectrogram (Draw + Hear)</title>
     <style>
       html,
       body {
@@ -39,6 +39,7 @@
         height: 100%;
         display: block;
         background: black;
+        touch-action: none;
       }
 
       .mono {
@@ -46,20 +47,31 @@
           ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
           "Liberation Mono", "Courier New", monospace;
       }
+
+      .hint {
+        opacity: 0.75;
+      }
     </style>
   </head>
   <body>
     <div class="wrap">
       <div class="bar">
-        <input id="file" type="file" accept="audio/mpeg,audio/mp3" />
-        <button id="render" disabled>Render</button>
+        <input
+          id="file"
+          type="file"
+          accept="audio/mpeg,audio/mp3,audio/wav,audio/*"
+        />
+        <button id="render" disabled>Render Spectrogram</button>
 
-        <button id="play" disabled>Play</button>
+        <button id="play" disabled>Play (what you drew)</button>
         <button id="pause" disabled>Pause</button>
         <button id="stop" disabled>Stop</button>
 
+        <button id="clear" disabled>Clear Drawing</button>
+
         <span id="status" class="mono"></span>
         <span id="time" class="mono"></span>
+        <span class="hint mono">Left=draw RED, Right=erase</span>
       </div>
 
       <canvas id="canvas"></canvas>
@@ -97,47 +109,65 @@
         return [0, 0, 0];
       };
 
-      // ---------------- FFT ----------------
+      const resizeCanvasToCSS = (canvas) => {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== w) canvas.width = w;
+        if (canvas.height !== h) canvas.height = h;
+        return { dpr, w, h };
+      };
+
+      // ---------------- window ----------------
 
       const hann = (N) => {
         const w = new Float32Array(N);
-        for (let i = 0; i < N; i++) {
+        for (let i = 0; i < N; i++)
           w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1));
-        }
         return w;
       };
 
-      const fftMagnitudes = (input, window) => {
-        const N = input.length;
-        const re = new Float32Array(N);
-        const im = new Float32Array(N);
+      // ---------------- FFT (in-place complex) ----------------
+      // Cooley–Tukey radix-2. re/im length must be power-of-2.
 
-        for (let i = 0; i < N; i++) re[i] = input[i] * window[i];
-
+      const bitReversePermute = (re, im) => {
+        const N = re.length;
         for (let i = 1, j = 0; i < N; i++) {
           let bit = N >> 1;
           for (; j & bit; bit >>= 1) j ^= bit;
           j ^= bit;
-          if (i < j) [re[i], re[j]] = [re[j], re[i]];
+          if (i < j) {
+            [re[i], re[j]] = [re[j], re[i]];
+            [im[i], im[j]] = [im[j], im[i]];
+          }
         }
+      };
+
+      const fftInPlace = (re, im, inverse = false) => {
+        const N = re.length;
+        bitReversePermute(re, im);
 
         for (let len = 2; len <= N; len <<= 1) {
-          const ang = (-2 * Math.PI) / len;
+          const ang = ((inverse ? 2 : -2) * Math.PI) / len;
           const wlenRe = Math.cos(ang);
           const wlenIm = Math.sin(ang);
+
           for (let i = 0; i < N; i += len) {
-            let wRe = 1,
-              wIm = 0;
-            for (let j = 0; j < len / 2; j++) {
+            let wRe = 1;
+            let wIm = 0;
+            const half = len >> 1;
+
+            for (let j = 0; j < half; j++) {
               const uRe = re[i + j];
               const uIm = im[i + j];
-              const vRe = re[i + j + len / 2] * wRe - im[i + j + len / 2] * wIm;
-              const vIm = re[i + j + len / 2] * wIm + im[i + j + len / 2] * wRe;
+
+              const vRe = re[i + j + half] * wRe - im[i + j + half] * wIm;
+              const vIm = re[i + j + half] * wIm + im[i + j + half] * wRe;
 
               re[i + j] = uRe + vRe;
               im[i + j] = uIm + vIm;
-              re[i + j + len / 2] = uRe - vRe;
-              im[i + j + len / 2] = uIm - vIm;
+              re[i + j + half] = uRe - vRe;
+              im[i + j + half] = uIm - vIm;
 
               const nRe = wRe * wlenRe - wIm * wlenIm;
               wIm = wRe * wlenIm + wIm * wlenRe;
@@ -146,13 +176,16 @@
           }
         }
 
-        const bins = N / 2 + 1;
-        const mag = new Float32Array(bins);
-        for (let k = 0; k < bins; k++) mag[k] = Math.hypot(re[k], im[k]);
-        return mag;
+        if (inverse) {
+          const invN = 1 / N;
+          for (let i = 0; i < N; i++) {
+            re[i] *= invN;
+            im[i] *= invN;
+          }
+        }
       };
 
-      // ---------------- spectrogram ----------------
+      // ---------------- spectrogram (analysis only) ----------------
 
       const computeSpectrogram = ({
         samples,
@@ -164,7 +197,10 @@
       }) => {
         const window = hann(winSize);
         const nyquist = sampleRate / 2;
-        const maxBin = Math.floor((maxFreqHz / nyquist) * (winSize / 2));
+        const maxBin = Math.min(
+          winSize / 2,
+          Math.floor((maxFreqHz / nyquist) * (winSize / 2))
+        );
 
         const frames = Math.max(
           0,
@@ -174,14 +210,25 @@
         const data = new Array(frames);
         let maxDb = -Infinity;
 
+        const re = new Float32Array(winSize);
+        const im = new Float32Array(winSize);
+
         for (let f = 0; f < frames; f++) {
           const start = f * hopSize;
-          const slice = samples.subarray(start, start + winSize);
-          const mags = fftMagnitudes(slice, window);
+
+          re.fill(0);
+          im.fill(0);
+
+          for (let i = 0; i < winSize; i++) {
+            re[i] = (samples[start + i] || 0) * window[i];
+          }
+
+          fftInPlace(re, im, false);
 
           const row = new Float32Array(maxBin);
           for (let b = 0; b < maxBin; b++) {
-            const db = 20 * Math.log10(mags[b] / winSize + 1e-12);
+            const mag = Math.hypot(re[b], im[b]);
+            const db = 20 * Math.log10(mag / winSize + 1e-12);
             row[b] = db;
             if (db > maxDb) maxDb = db;
           }
@@ -232,15 +279,6 @@
         return off;
       };
 
-      const resizeCanvasToCSS = (canvas) => {
-        const dpr = window.devicePixelRatio || 1;
-        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-        if (canvas.width !== w) canvas.width = w;
-        if (canvas.height !== h) canvas.height = h;
-        return { dpr, w, h };
-      };
-
       // ---------------- audio player (buffer source) ----------------
 
       class AudioPlayer {
@@ -251,9 +289,9 @@
           this.source = null;
           this.gain = null;
 
-          this.startedAt = 0; // ctx.currentTime when started
-          this.offsetSec = 0; // playback offset when (re)starting
-          this.state = "stopped"; // "playing" | "paused" | "stopped"
+          this.startedAt = 0;
+          this.offsetSec = 0;
+          this.state = "stopped";
         }
 
         async ensureContext() {
@@ -262,6 +300,7 @@
           if (this.ctx.state === "suspended") await this.ctx.resume();
           if (!this.gain) {
             this.gain = this.ctx.createGain();
+            this.gain.gain.value = 1.0;
             this.gain.connect(this.ctx.destination);
           }
         }
@@ -306,7 +345,6 @@
         async play() {
           if (!this.buffer) return;
           await this.ensureContext();
-
           if (this.state === "playing") return;
 
           this.source = this._makeSource();
@@ -341,7 +379,7 @@
         }
       }
 
-      // ---------------- app ----------------
+      // ---------------- app state ----------------
 
       const els = {
         file: document.getElementById("file"),
@@ -349,6 +387,7 @@
         play: document.getElementById("play"),
         pause: document.getElementById("pause"),
         stop: document.getElementById("stop"),
+        clear: document.getElementById("clear"),
         status: document.getElementById("status"),
         time: document.getElementById("time"),
         canvas: document.getElementById("canvas"),
@@ -360,14 +399,21 @@
       let spec = null;
       let bitmap = null;
 
+      // mask: 0..1, per [frame][bin]
+      let drawMask = null;
+
+      // red overlay (no opacity)
+      let maskCanvas = null;
+      let maskCtx = null;
+
       const WIN_SIZE = 4096;
       const HOP_SIZE = 512;
-      const MAX_FREQ_HZ = 12000;
+      const MAX_FREQ_HZ = 7000;
       const DB_RANGE = 80;
 
       const setStatus = (t) => (els.status.textContent = t);
 
-      const decodeMp3 = async (file) => {
+      const decodeAudioFile = async (file) => {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
 
@@ -381,6 +427,130 @@
         return { buffer, mono, sampleRate: buffer.sampleRate };
       };
 
+      const initMask = (spec) => {
+        drawMask = Array.from({ length: spec.frames }, () =>
+          new Float32Array(spec.bins).fill(0)
+        );
+
+        maskCanvas = document.createElement("canvas");
+        maskCanvas.width = spec.frames;
+        maskCanvas.height = spec.bins;
+        maskCtx = maskCanvas.getContext("2d", { willReadFrequently: false });
+        maskCtx.imageSmoothingEnabled = false;
+        maskCtx.clearRect(0, 0, spec.frames, spec.bins);
+      };
+
+      const clearMask = () => {
+        if (!drawMask || !maskCtx || !spec) return;
+        for (let x = 0; x < spec.frames; x++) drawMask[x].fill(0);
+        maskCtx.clearRect(0, 0, spec.frames, spec.bins);
+      };
+
+      // canvas->spec coords (frame x, bin y)
+      const canvasToSpec = (clientX, clientY) => {
+        const rect = els.canvas.getBoundingClientRect();
+        const xCss = clientX - rect.left;
+        const yCss = clientY - rect.top;
+
+        const fx = clamp(
+          Math.floor((xCss / rect.width) * spec.frames),
+          0,
+          spec.frames - 1
+        );
+        const byTop = clamp(
+          Math.floor((yCss / rect.height) * spec.bins),
+          0,
+          spec.bins - 1
+        );
+        const bin = spec.bins - 1 - byTop; // bottom is low freq
+        return [fx, bin];
+      };
+
+      const paintCell = (frameX, binY, value01) => {
+        if (!drawMask || !maskCtx || !spec) return;
+
+        drawMask[frameX][binY] = value01;
+
+        const cy = spec.bins - 1 - binY; // maskCanvas y=0 is top
+        if (value01 >= 0.5) {
+          maskCtx.fillStyle = "rgba(255,0,0,1)"; // RED, no opacity
+          maskCtx.fillRect(frameX, cy, 1, 1);
+        } else {
+          maskCtx.clearRect(frameX, cy, 1, 1);
+        }
+      };
+
+      // ---------------- masked resynthesis ----------------
+      // Builds an AudioBuffer where only the drawn regions are audible.
+      // FIX: proper overlap-add normalization (no tiny volume).
+
+      const resynthesizeMasked = async () => {
+        if (!decoded || !spec || !drawMask) return null;
+
+        await player.ensureContext();
+
+        const { mono, sampleRate } = decoded;
+        const outBuf = player.ctx.createBuffer(1, mono.length, sampleRate);
+        const out = outBuf.getChannelData(0);
+
+        const window = hann(WIN_SIZE);
+        const norm = new Float32Array(out.length);
+
+        const re = new Float32Array(WIN_SIZE);
+        const im = new Float32Array(WIN_SIZE);
+
+        const hop = HOP_SIZE;
+
+        for (let f = 0; f < spec.frames; f++) {
+          const start = f * hop;
+
+          re.fill(0);
+          im.fill(0);
+
+          for (let i = 0; i < WIN_SIZE; i++) {
+            re[i] = (mono[start + i] || 0) * window[i];
+          }
+
+          fftInPlace(re, im, false);
+
+          // Only keep drawn bins up to spec.bins, and also zero everything above it
+          // (so you don't accidentally hear unmasked high frequencies).
+          const maxBin = spec.bins;
+
+          // DC..Nyquist half
+          for (let b = 0; b <= WIN_SIZE / 2; b++) {
+            const m = b < maxBin ? drawMask[f][b] : 0;
+            re[b] *= m;
+            im[b] *= m;
+
+            if (b !== 0 && b !== WIN_SIZE / 2) {
+              const mb = WIN_SIZE - b;
+              re[mb] *= m;
+              im[mb] *= m;
+            }
+          }
+
+          fftInPlace(re, im, true);
+
+          for (let i = 0; i < WIN_SIZE; i++) {
+            const idx = start + i;
+            if (idx >= out.length) break;
+            const w = window[i];
+            out[idx] += re[i] * w;
+            norm[idx] += w * w;
+          }
+        }
+
+        for (let i = 0; i < out.length; i++) {
+          const n = norm[i];
+          out[i] = n > 1e-8 ? out[i] / n : 0;
+        }
+
+        return outBuf;
+      };
+
+      // ---------------- draw loop ----------------
+
       const draw = () => {
         const ctx = els.canvas.getContext("2d");
         const { w, h } = resizeCanvasToCSS(els.canvas);
@@ -390,6 +560,14 @@
         if (bitmap) {
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(bitmap, 0, 0, w, h);
+        }
+
+        if (maskCanvas) {
+          ctx.save();
+          ctx.imageSmoothingEnabled = false;
+          ctx.globalAlpha = 1; // NO OPACITY
+          ctx.drawImage(maskCanvas, 0, 0, w, h);
+          ctx.restore();
         }
 
         // playback cursor
@@ -407,7 +585,6 @@
           ctx.restore();
         }
 
-        // time readout
         if (spec) {
           const t = player.currentTimeSec();
           els.time.textContent = `${formatSec(t)} / ${formatSec(spec.durationSec)}`;
@@ -424,25 +601,34 @@
 
       window.addEventListener("resize", () => draw(), { passive: true });
 
+      // ---------------- UI wiring ----------------
+
+      const setButtons = (ready) => {
+        els.render.disabled = !ready;
+        els.play.disabled = !ready;
+        els.pause.disabled = !ready;
+        els.stop.disabled = !ready;
+        els.clear.disabled = !ready;
+      };
+
       els.file.addEventListener("change", async () => {
         const file = els.file.files?.[0];
         if (!file) return;
 
         setStatus("decoding…");
-        els.render.disabled = true;
-        els.play.disabled = true;
-        els.pause.disabled = true;
-        els.stop.disabled = true;
+        setButtons(false);
 
         spec = null;
         bitmap = null;
         decoded = null;
+        drawMask = null;
+        maskCanvas = null;
+        maskCtx = null;
+
         player.stop();
 
         try {
-          decoded = await decodeMp3(file);
-          player.setBuffer(decoded.buffer);
-
+          decoded = await decodeAudioFile(file);
           setStatus(
             `ready (${decoded.sampleRate} Hz, ${formatSec(decoded.buffer.duration)})`
           );
@@ -456,11 +642,16 @@
       els.render.addEventListener("click", async () => {
         if (!decoded) return;
 
-        setStatus("rendering…");
+        setStatus("rendering spectrogram…");
         els.render.disabled = true;
+        setButtons(false);
+
         player.stop();
         bitmap = null;
         spec = null;
+        drawMask = null;
+        maskCanvas = null;
+        maskCtx = null;
 
         await new Promise((r) => setTimeout(r, 0));
 
@@ -475,24 +666,46 @@
           });
 
           bitmap = makeSpectrogramBitmap(spec);
+          initMask(spec);
 
-          setStatus("done");
-          els.play.disabled = false;
-          els.pause.disabled = false;
-          els.stop.disabled = false;
-          draw();
+          setStatus("spectrogram ready (draw RED to hear; erase to remove)");
+          setButtons(true);
         } catch (e) {
           console.error(e);
           setStatus("render failed");
+          setButtons(false);
         } finally {
           els.render.disabled = false;
         }
       });
 
+      els.clear.addEventListener("click", () => {
+        clearMask();
+        setStatus("cleared");
+      });
+
       els.play.addEventListener("click", async () => {
-        if (!decoded || !spec) return;
-        setStatus("playing");
-        await player.play();
+        if (!decoded || !spec || !drawMask) return;
+
+        setStatus("building audio from drawing…");
+        els.play.disabled = true;
+
+        try {
+          const maskedBuffer = await resynthesizeMasked();
+          if (!maskedBuffer) {
+            setStatus("failed to build audio");
+            return;
+          }
+          player.setBuffer(maskedBuffer);
+
+          setStatus("playing");
+          await player.play();
+        } catch (e) {
+          console.error(e);
+          setStatus("play failed");
+        } finally {
+          els.play.disabled = false;
+        }
       });
 
       els.pause.addEventListener("click", () => {
@@ -506,6 +719,41 @@
         setStatus("stopped");
         draw();
       });
+
+      // ---------------- drawing interactions ----------------
+
+      let drawing = false;
+      let drawValue = 1; // 1 draw, 0 erase
+
+      els.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+      els.canvas.addEventListener("pointerdown", (e) => {
+        if (!spec || !drawMask) return;
+        drawing = true;
+        drawValue = e.button === 2 ? 0 : 1;
+        els.canvas.setPointerCapture(e.pointerId);
+
+        const [fx, by] = canvasToSpec(e.clientX, e.clientY);
+        paintCell(fx, by, drawValue);
+      });
+
+      els.canvas.addEventListener("pointermove", (e) => {
+        if (!drawing || !spec || !drawMask) return;
+        const [fx, by] = canvasToSpec(e.clientX, e.clientY);
+        paintCell(fx, by, drawValue);
+      });
+
+      const endDraw = () => {
+        drawing = false;
+      };
+
+      els.canvas.addEventListener("pointerup", endDraw);
+      els.canvas.addEventListener("pointercancel", endDraw);
+      els.canvas.addEventListener("pointerleave", endDraw);
+
+      // initial
+      setStatus("load an audio file");
+      setButtons(false);
     </script>
   </body>
 </html>
