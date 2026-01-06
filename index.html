@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Canvas Spectrogram</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #06080c;
+        color: #e6edf3;
+        font-family: system-ui, sans-serif;
+      }
+
+      .wrap {
+        height: 100%;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        gap: 10px;
+        padding: 12px;
+        box-sizing: border-box;
+      }
+
+      .bar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+        background: black;
+      }
+
+      .mono {
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="bar">
+        <input id="file" type="file" accept="audio/mpeg,audio/mp3" />
+        <button id="render" disabled>Render</button>
+
+        <button id="play" disabled>Play</button>
+        <button id="pause" disabled>Pause</button>
+        <button id="stop" disabled>Stop</button>
+
+        <span id="status" class="mono"></span>
+        <span id="time" class="mono"></span>
+      </div>
+
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <script type="module">
+      // ---------------- utilities ----------------
+
+      const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+
+      const formatSec = (s) => {
+        if (!Number.isFinite(s)) return "—";
+        const m = Math.floor(s / 60);
+        const r = s - m * 60;
+        return `${m}:${r.toFixed(2).padStart(5, "0")}`;
+      };
+
+      const colorMap = (t) => {
+        t = clamp(t, 0, 1);
+        const stops = [
+          [0.0, [0, 0, 0]],
+          [0.25, [32, 0, 64]],
+          [0.5, [0, 120, 200]],
+          [0.75, [240, 220, 80]],
+          [1.0, [255, 255, 255]],
+        ];
+        for (let i = 0; i < stops.length - 1; i++) {
+          const [t0, c0] = stops[i];
+          const [t1, c1] = stops[i + 1];
+          if (t >= t0 && t <= t1) {
+            const u = (t - t0) / (t1 - t0);
+            return c0.map((v, j) => Math.round(v + (c1[j] - v) * u));
+          }
+        }
+        return [0, 0, 0];
+      };
+
+      // ---------------- FFT ----------------
+
+      const hann = (N) => {
+        const w = new Float32Array(N);
+        for (let i = 0; i < N; i++) {
+          w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1));
+        }
+        return w;
+      };
+
+      const fftMagnitudes = (input, window) => {
+        const N = input.length;
+        const re = new Float32Array(N);
+        const im = new Float32Array(N);
+
+        for (let i = 0; i < N; i++) re[i] = input[i] * window[i];
+
+        for (let i = 1, j = 0; i < N; i++) {
+          let bit = N >> 1;
+          for (; j & bit; bit >>= 1) j ^= bit;
+          j ^= bit;
+          if (i < j) [re[i], re[j]] = [re[j], re[i]];
+        }
+
+        for (let len = 2; len <= N; len <<= 1) {
+          const ang = (-2 * Math.PI) / len;
+          const wlenRe = Math.cos(ang);
+          const wlenIm = Math.sin(ang);
+          for (let i = 0; i < N; i += len) {
+            let wRe = 1,
+              wIm = 0;
+            for (let j = 0; j < len / 2; j++) {
+              const uRe = re[i + j];
+              const uIm = im[i + j];
+              const vRe = re[i + j + len / 2] * wRe - im[i + j + len / 2] * wIm;
+              const vIm = re[i + j + len / 2] * wIm + im[i + j + len / 2] * wRe;
+
+              re[i + j] = uRe + vRe;
+              im[i + j] = uIm + vIm;
+              re[i + j + len / 2] = uRe - vRe;
+              im[i + j + len / 2] = uIm - vIm;
+
+              const nRe = wRe * wlenRe - wIm * wlenIm;
+              wIm = wRe * wlenIm + wIm * wlenRe;
+              wRe = nRe;
+            }
+          }
+        }
+
+        const bins = N / 2 + 1;
+        const mag = new Float32Array(bins);
+        for (let k = 0; k < bins; k++) mag[k] = Math.hypot(re[k], im[k]);
+        return mag;
+      };
+
+      // ---------------- spectrogram ----------------
+
+      const computeSpectrogram = ({
+        samples,
+        sampleRate,
+        winSize,
+        hopSize,
+        maxFreqHz,
+        dbRange,
+      }) => {
+        const window = hann(winSize);
+        const nyquist = sampleRate / 2;
+        const maxBin = Math.floor((maxFreqHz / nyquist) * (winSize / 2));
+
+        const frames = Math.max(
+          0,
+          Math.floor((samples.length - winSize) / hopSize) + 1
+        );
+
+        const data = new Array(frames);
+        let maxDb = -Infinity;
+
+        for (let f = 0; f < frames; f++) {
+          const start = f * hopSize;
+          const slice = samples.subarray(start, start + winSize);
+          const mags = fftMagnitudes(slice, window);
+
+          const row = new Float32Array(maxBin);
+          for (let b = 0; b < maxBin; b++) {
+            const db = 20 * Math.log10(mags[b] / winSize + 1e-12);
+            row[b] = db;
+            if (db > maxDb) maxDb = db;
+          }
+          data[f] = row;
+        }
+
+        const floorDb = maxDb - dbRange;
+
+        return {
+          data,
+          frames,
+          bins: maxBin,
+          maxDb,
+          floorDb,
+          sampleRate,
+          hopSize,
+          winSize,
+          durationSec: samples.length / sampleRate,
+        };
+      };
+
+      // ---------------- rendering ----------------
+
+      const makeSpectrogramBitmap = (spec) => {
+        const { data, frames, bins, maxDb, floorDb } = spec;
+
+        const img = new ImageData(frames, bins);
+        const out = img.data;
+
+        for (let x = 0; x < frames; x++) {
+          const col = data[x];
+          for (let y = 0; y < bins; y++) {
+            const db = col[bins - 1 - y]; // low freq bottom
+            const t = (db - floorDb) / (maxDb - floorDb);
+            const [r, g, b] = colorMap(t);
+            const i = (y * frames + x) * 4;
+            out[i] = r;
+            out[i + 1] = g;
+            out[i + 2] = b;
+            out[i + 3] = 255;
+          }
+        }
+
+        const off = document.createElement("canvas");
+        off.width = frames;
+        off.height = bins;
+        off.getContext("2d").putImageData(img, 0, 0);
+        return off;
+      };
+
+      const resizeCanvasToCSS = (canvas) => {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== w) canvas.width = w;
+        if (canvas.height !== h) canvas.height = h;
+        return { dpr, w, h };
+      };
+
+      // ---------------- audio player (buffer source) ----------------
+
+      class AudioPlayer {
+        constructor() {
+          this.ctx = null;
+          this.buffer = null;
+
+          this.source = null;
+          this.gain = null;
+
+          this.startedAt = 0; // ctx.currentTime when started
+          this.offsetSec = 0; // playback offset when (re)starting
+          this.state = "stopped"; // "playing" | "paused" | "stopped"
+        }
+
+        async ensureContext() {
+          if (!this.ctx)
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+          if (this.ctx.state === "suspended") await this.ctx.resume();
+          if (!this.gain) {
+            this.gain = this.ctx.createGain();
+            this.gain.connect(this.ctx.destination);
+          }
+        }
+
+        setBuffer(buffer) {
+          this.buffer = buffer;
+          this.stop();
+        }
+
+        _makeSource() {
+          const s = this.ctx.createBufferSource();
+          s.buffer = this.buffer;
+          s.connect(this.gain);
+          s.onended = () => {
+            if (
+              this.state === "playing" &&
+              this.currentTimeSec() >= this.durationSec() - 0.02
+            ) {
+              this.state = "stopped";
+              this.offsetSec = 0;
+            }
+          };
+          return s;
+        }
+
+        durationSec() {
+          return this.buffer ? this.buffer.duration : 0;
+        }
+
+        currentTimeSec() {
+          if (!this.ctx) return 0;
+          if (this.state === "playing") {
+            return clamp(
+              this.offsetSec + (this.ctx.currentTime - this.startedAt),
+              0,
+              this.durationSec()
+            );
+          }
+          return clamp(this.offsetSec, 0, this.durationSec());
+        }
+
+        async play() {
+          if (!this.buffer) return;
+          await this.ensureContext();
+
+          if (this.state === "playing") return;
+
+          this.source = this._makeSource();
+          this.startedAt = this.ctx.currentTime;
+          this.source.start(0, this.offsetSec);
+          this.state = "playing";
+        }
+
+        pause() {
+          if (this.state !== "playing") return;
+          this.offsetSec = this.currentTimeSec();
+          this._stopSourceOnly();
+          this.state = "paused";
+        }
+
+        stop() {
+          this.offsetSec = 0;
+          this._stopSourceOnly();
+          this.state = "stopped";
+        }
+
+        _stopSourceOnly() {
+          if (!this.source) return;
+          try {
+            this.source.onended = null;
+            this.source.stop();
+          } catch {}
+          try {
+            this.source.disconnect();
+          } catch {}
+          this.source = null;
+        }
+      }
+
+      // ---------------- app ----------------
+
+      const els = {
+        file: document.getElementById("file"),
+        render: document.getElementById("render"),
+        play: document.getElementById("play"),
+        pause: document.getElementById("pause"),
+        stop: document.getElementById("stop"),
+        status: document.getElementById("status"),
+        time: document.getElementById("time"),
+        canvas: document.getElementById("canvas"),
+      };
+
+      const player = new AudioPlayer();
+
+      let decoded = null; // { buffer, mono, sampleRate }
+      let spec = null;
+      let bitmap = null;
+
+      const WIN_SIZE = 4096;
+      const HOP_SIZE = 512;
+      const MAX_FREQ_HZ = 12000;
+      const DB_RANGE = 80;
+
+      const setStatus = (t) => (els.status.textContent = t);
+
+      const decodeMp3 = async (file) => {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+
+        const mono = new Float32Array(buffer.length);
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          const d = buffer.getChannelData(c);
+          for (let i = 0; i < d.length; i++)
+            mono[i] += d[i] / buffer.numberOfChannels;
+        }
+
+        return { buffer, mono, sampleRate: buffer.sampleRate };
+      };
+
+      const draw = () => {
+        const ctx = els.canvas.getContext("2d");
+        const { w, h } = resizeCanvasToCSS(els.canvas);
+
+        ctx.clearRect(0, 0, w, h);
+
+        if (bitmap) {
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(bitmap, 0, 0, w, h);
+        }
+
+        // playback cursor
+        if (spec && player.state === "playing") {
+          const t = player.currentTimeSec();
+          const x = (t / spec.durationSec) * w;
+
+          ctx.save();
+          ctx.strokeStyle = "rgba(255,255,255,0.85)";
+          ctx.lineWidth = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, h);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // time readout
+        if (spec) {
+          const t = player.currentTimeSec();
+          els.time.textContent = `${formatSec(t)} / ${formatSec(spec.durationSec)}`;
+        } else {
+          els.time.textContent = "";
+        }
+      };
+
+      const tick = () => {
+        draw();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+
+      window.addEventListener("resize", () => draw(), { passive: true });
+
+      els.file.addEventListener("change", async () => {
+        const file = els.file.files?.[0];
+        if (!file) return;
+
+        setStatus("decoding…");
+        els.render.disabled = true;
+        els.play.disabled = true;
+        els.pause.disabled = true;
+        els.stop.disabled = true;
+
+        spec = null;
+        bitmap = null;
+        decoded = null;
+        player.stop();
+
+        try {
+          decoded = await decodeMp3(file);
+          player.setBuffer(decoded.buffer);
+
+          setStatus(
+            `ready (${decoded.sampleRate} Hz, ${formatSec(decoded.buffer.duration)})`
+          );
+          els.render.disabled = false;
+        } catch (e) {
+          console.error(e);
+          setStatus("decode failed");
+        }
+      });
+
+      els.render.addEventListener("click", async () => {
+        if (!decoded) return;
+
+        setStatus("rendering…");
+        els.render.disabled = true;
+        player.stop();
+        bitmap = null;
+        spec = null;
+
+        await new Promise((r) => setTimeout(r, 0));
+
+        try {
+          spec = computeSpectrogram({
+            samples: decoded.mono,
+            sampleRate: decoded.sampleRate,
+            winSize: WIN_SIZE,
+            hopSize: HOP_SIZE,
+            maxFreqHz: MAX_FREQ_HZ,
+            dbRange: DB_RANGE,
+          });
+
+          bitmap = makeSpectrogramBitmap(spec);
+
+          setStatus("done");
+          els.play.disabled = false;
+          els.pause.disabled = false;
+          els.stop.disabled = false;
+          draw();
+        } catch (e) {
+          console.error(e);
+          setStatus("render failed");
+        } finally {
+          els.render.disabled = false;
+        }
+      });
+
+      els.play.addEventListener("click", async () => {
+        if (!decoded || !spec) return;
+        setStatus("playing");
+        await player.play();
+      });
+
+      els.pause.addEventListener("click", () => {
+        player.pause();
+        setStatus("paused");
+        draw();
+      });
+
+      els.stop.addEventListener("click", () => {
+        player.stop();
+        setStatus("stopped");
+        draw();
+      });
+    </script>
+  </body>
+</html>
